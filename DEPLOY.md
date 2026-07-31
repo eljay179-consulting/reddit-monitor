@@ -5,7 +5,7 @@ One-time setup, in order. Each step blocks the next.
 ## 0. Prerequisites
 
 - The GitHub org exists (created via github.com — this repo assumes it's already there)
-- This folder is pushed to `<org>/reddit-homeschool-monitor` on `main`
+- This folder is pushed to `eljay179-consulting/reddit-monitor` on `main`
 - You have SSH access to johnsonserve already, under some username (`SSH_USER` below)
 
 ## 1. Install the deploy key on johnsonserve
@@ -23,14 +23,16 @@ chmod 600 ~/.ssh/authorized_keys
 The Action only runs `git pull` — it needs an existing clone and a working `.env` to pull into.
 
 ```bash
-git clone git@github.com:<org>/reddit-homeschool-monitor.git /path/to/reddit-homeschool-monitor
-cd /path/to/reddit-homeschool-monitor
+git clone git@github.com:eljay179-consulting/reddit-monitor.git /path/to/reddit-monitor
+cd /path/to/reddit-monitor
 cp .env.example .env
-# fill in .env for real (Reddit creds, HOST_VAULT_INBOX_PATH) — see README.md
+cp watches.example.json watches.json
+# fill in .env for real (Reddit creds, HOST_VAULT_INBOX_PATH) and add your
+# projects' subreddits/keywords to watches.json — see README.md
 docker compose up -d --build
 ```
 
-`.env` is gitignored and stays local to the server — `git pull` never touches it.
+`.env` and `watches.json` are both gitignored and stay local to the server — `git pull` never touches either. Adding a new project later just means editing `watches.json` and `docker compose restart`, no git involved.
 
 ## 3. Create a Tailscale OAuth client
 
@@ -64,7 +66,7 @@ Repo → **Settings → Secrets and variables → Actions → New repository sec
 | `SSH_HOST` | johnsonserve's tailnet IP (`100.116.62.94`) or MagicDNS name if enabled |
 | `SSH_USER` | the SSH user from step 1 |
 | `SSH_PRIVATE_KEY` | full contents of `.deploy-key-DO-NOT-COMMIT/deploy_key` (the private key, not `.pub`) |
-| `DEPLOY_PATH` | the path used in step 2, e.g. `/path/to/reddit-homeschool-monitor` |
+| `DEPLOY_PATH` | the path used in step 2, e.g. `/path/to/reddit-monitor` |
 
 ## 6. Delete the local key files
 

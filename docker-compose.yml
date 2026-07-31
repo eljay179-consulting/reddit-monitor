@@ -1,7 +1,7 @@
 services:
-  reddit-homeschool-monitor:
+  reddit-monitor:
     build: .
-    container_name: reddit-homeschool-monitor
+    container_name: reddit-monitor
     restart: unless-stopped
     env_file:
       - .env
@@ -9,5 +9,10 @@ services:
       # Fixed path inside the container — the actual vault location on the
       # host is set via HOST_VAULT_INBOX_PATH in .env, mapped below.
       VAULT_INBOX_PATH: /vault-inbox
+      WATCHES_CONFIG_PATH: /app/watches.json
     volumes:
       - ${HOST_VAULT_INBOX_PATH}:/vault-inbox
+      # watches.json is bind-mounted (not baked into the image) so adding or
+      # editing a project's subreddits/keywords only needs a container
+      # restart, not a rebuild.
+      - ./watches.json:/app/watches.json:ro
