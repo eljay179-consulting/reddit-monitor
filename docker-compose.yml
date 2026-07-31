@@ -1,0 +1,13 @@
+services:
+  reddit-homeschool-monitor:
+    build: .
+    container_name: reddit-homeschool-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Fixed path inside the container — the actual vault location on the
+      # host is set via HOST_VAULT_INBOX_PATH in .env, mapped below.
+      VAULT_INBOX_PATH: /vault-inbox
+    volumes:
+      - ${HOST_VAULT_INBOX_PATH}:/vault-inbox

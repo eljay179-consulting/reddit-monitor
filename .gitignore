@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+
+# Deploy keypair generated for GitHub Actions -> johnsonserve. Never commit
+# this. Delete the whole folder locally once the key is installed on the
+# server and saved as a GitHub secret (see DEPLOY.md step 6).
+.deploy-key-DO-NOT-COMMIT/
