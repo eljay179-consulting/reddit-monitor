@@ -1,8 +1,20 @@
 services:
   reddit-monitor:
-    build: .
+    build:
+      context: .
+      args:
+        # Must match `user:` below — this is what makes the seen-state named
+        # volume writable by the non-root container.
+        APP_UID: "${RUN_AS_UID}"
+        APP_GID: "${RUN_AS_GID}"
     container_name: reddit-monitor
     restart: unless-stopped
+    # Run as the vault's owner rather than root. Notes are written into a
+    # bind-mounted Obsidian vault that other tooling (Obsidian itself, the
+    # personalkb-git-sync script, syncthing) touches as a normal user — a
+    # root-owned note in there is one they can't edit or commit. Set
+    # RUN_AS_UID/GID in .env to the owner of HOST_VAULT_INBOX_PATH.
+    user: "${RUN_AS_UID}:${RUN_AS_GID}"
     env_file:
       - .env
     environment:
