@@ -2,7 +2,8 @@
   "watches": [
     {
       "name": "readysetscholar",
-      "subreddits": "homeschool+Homeschooling",
+      "source": "reddit",
+      "targets": ["homeschool+Homeschooling"],
       "keywords": [
         "transcript",
         "gpa",
@@ -14,6 +15,38 @@
         "homeschool affidavit",
         "homeschool compliance",
         "homeschool records"
+      ]
+    },
+    {
+      "name": "0x307",
+      "source": "reddit",
+      "targets": ["LocalLLaMA+AI_Agents+mcp"],
+      "keywords": [
+        "agent registry",
+        "agent discovery",
+        "agent identity",
+        "agent payment",
+        "agent payments",
+        "x402",
+        "a2a protocol",
+        "agentic commerce",
+        "agent gateway",
+        "agent marketplace"
+      ]
+    },
+    {
+      "name": "0x307-youtube",
+      "source": "youtube",
+      "targets": [
+        "REPLACE_WITH_CHANNEL_ID"
+      ],
+      "keywords": [
+        "agent registry",
+        "agent payment",
+        "x402",
+        "mcp",
+        "agentic",
+        "ai agent infrastructure"
       ]
     }
   ]

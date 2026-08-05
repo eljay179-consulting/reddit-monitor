@@ -73,6 +73,11 @@ RETRY_MAX_SECONDS = 30 * 60
 # limit (empirically tight — see run_watch's docstring context above).
 STARTUP_STAGGER_SECONDS = 20
 
+# Seconds to pause between individual feeds within one watch. A YouTube watch
+# covering several channels is several requests; same rate-limit reasoning as
+# STARTUP_STAGGER_SECONDS, at a smaller scale.
+INTER_FEED_DELAY_SECONDS = 5
+
 # How many seen-post IDs to retain per watch. Reddit's per-subreddit RSS
 # returns ~25 latest posts, so this comfortably covers the feed window with
 # room to spare — not meant to be a long-term archive.
@@ -82,12 +87,24 @@ MAX_SEEN_IDS = 500
 @dataclass
 class Watch:
     name: str
-    subreddits: str  # e.g. "homeschool+Homeschooling" — used to build the feed URL
+    source: str  # "reddit" | "youtube"
+    targets: list[str]  # subreddit expressions, or YouTube channel IDs
     keywords: list[str]
 
     @property
-    def feed_url(self) -> str:
-        return f"https://www.reddit.com/r/{self.subreddits}/new/.rss"
+    def feed_urls(self) -> list[str]:
+        if self.source == "reddit":
+            # One feed can cover many subreddits via Reddit's "a+b+c" syntax,
+            # so a single target string usually suffices.
+            return [f"https://www.reddit.com/r/{t}/new/.rss" for t in self.targets]
+        if self.source == "youtube":
+            # YouTube RSS is strictly one feed per channel — no multi-channel
+            # equivalent of Reddit's "+" syntax — so each target is its own URL.
+            return [
+                f"https://www.youtube.com/feeds/videos.xml?channel_id={t}"
+                for t in self.targets
+            ]
+        raise ValueError(f"Unknown source {self.source!r} for watch {self.name!r}")
 
     @property
     def seen_ids_path(self) -> Path:
@@ -96,14 +113,29 @@ class Watch:
 
 def load_watches() -> list[Watch]:
     data = json.loads(WATCHES_CONFIG_PATH.read_text(encoding="utf-8"))
-    watches = [
-        Watch(
-            name=w["name"],
-            subreddits=w["subreddits"],
-            keywords=[k.strip().lower() for k in w["keywords"] if k.strip()],
+    watches = []
+    for w in data["watches"]:
+        # `subreddits` is the original single-source schema. Kept working so an
+        # already-deployed watches.json doesn't break on upgrade; new entries
+        # should use explicit source/targets.
+        if "subreddits" in w:
+            source = "reddit"
+            targets = [w["subreddits"]]
+        else:
+            source = w["source"]
+            targets = w["targets"]
+            if isinstance(targets, str):
+                targets = [targets]
+
+        watches.append(
+            Watch(
+                name=w["name"],
+                source=source,
+                targets=targets,
+                keywords=[k.strip().lower() for k in w["keywords"] if k.strip()],
+            )
         )
-        for w in data["watches"]
-    ]
+
     if not watches:
         raise ValueError(f"No watches defined in {WATCHES_CONFIG_PATH}")
     return watches
@@ -135,16 +167,33 @@ def slugify(text: str, max_len: int = 60) -> str:
     return text[:max_len].strip("-") or "untitled"
 
 
-def fetch_entries(watch: Watch) -> list:
-    """Fetches and parses a watch's RSS feed. Raises on network/HTTP failure."""
+def fetch_feed(url: str) -> list:
+    """Fetches and parses one feed. Raises on network/HTTP failure."""
     response = requests.get(
-        watch.feed_url,
+        url,
         headers={"User-Agent": USER_AGENT},
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     parsed = feedparser.parse(response.content)
     return parsed.entries
+
+
+def fetch_entries(watch: Watch) -> list:
+    """
+    Fetches every feed for a watch and returns the combined entries.
+
+    Feeds are fetched sequentially with a short pause between them: a
+    multi-channel YouTube watch means several requests, and firing them
+    back-to-back is what tripped Reddit's rate limit during testing.
+    """
+    entries = []
+    urls = watch.feed_urls
+    for i, url in enumerate(urls):
+        if i > 0:
+            time.sleep(INTER_FEED_DELAY_SECONDS)
+        entries.extend(fetch_feed(url))
+    return entries
 
 
 def write_inbox_note(watch: Watch, entry, matched_keywords: list[str]) -> None:
@@ -155,16 +204,15 @@ def write_inbox_note(watch: Watch, entry, matched_keywords: list[str]) -> None:
         created = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
 
     timestamp = created.strftime("%Y%m%d-%H%M%S")
-    filename = f"{timestamp}-reddit-{watch.name}-{slugify(entry.title)}.md"
+    filename = f"{timestamp}-{watch.source}-{watch.name}-{slugify(entry.title)}.md"
     filepath = VAULT_INBOX_PATH / filename
 
     if filepath.exists():
         return
 
-    # Reddit's RSS entry content is an HTML snippet (usually a thumbnail + a
-    # link back to the post) rather than the plain self-text PRAW would have
-    # given us. Strip tags for a readable preview rather than dumping raw HTML
-    # into the note.
+    # Reddit's RSS content is an HTML snippet (thumbnail + link back to the
+    # post) rather than plain self-text; YouTube's is the video description.
+    # Strip tags either way rather than dumping raw HTML into the note.
     raw_body = getattr(entry, "summary", "") or ""
     body = re.sub(r"<[^>]+>", " ", raw_body)
     body = re.sub(r"\s+", " ", body).strip()
@@ -172,20 +220,28 @@ def write_inbox_note(watch: Watch, entry, matched_keywords: list[str]) -> None:
 
     link = getattr(entry, "link", "")
 
+    # Reddit entries carry the subreddit in the category; YouTube carries the
+    # channel name in author. Fall back to the watch's own targets so the note
+    # always says where it came from.
+    if watch.source == "youtube":
+        origin = getattr(entry, "author", None) or ", ".join(watch.targets)
+    else:
+        origin = f"r/{'+'.join(watch.targets)}"
+
     note = f"""---
-tags: [reddit-lead, {watch.name}]
+tags: [feed-lead, {watch.source}, {watch.name}]
 project: {watch.name}
-source: reddit-rss
-subreddit: r/{watch.subreddits}
+source: {watch.source}-rss
+origin: {origin}
 url: {link}
 created: {created.isoformat()}
 matched_keywords: [{", ".join(matched_keywords)}]
-replied: false
+reviewed: false
 ---
 
 # {entry.title}
 
-**Project:** {watch.name} · **r/{watch.subreddits}** · [{link}]({link})
+**Project:** {watch.name} · **{origin}** · [{link}]({link})
 
 {body_preview if body_preview else "*(no preview available)*"}
 
@@ -193,7 +249,7 @@ replied: false
 
 Matched on: {", ".join(matched_keywords)}
 
-Reply is manual — this note is only a heads-up.
+Surfaced for review — any reply or action is manual.
 """
     filepath.write_text(note, encoding="utf-8")
     print(f"[{timestamp}] [{watch.name}] wrote inbox note: {filename}", flush=True)
@@ -226,16 +282,19 @@ def poll_once(watch: Watch, seen_ids: set[str], first_run: bool) -> set[str]:
 
 
 def run_watch(watch: Watch) -> None:
-    """Polls one watch's RSS feed forever, retrying with backoff on error."""
+    """Polls one watch's feed(s) forever, retrying with backoff on error."""
     seen_ids = load_seen_ids(watch)
     first_run = not seen_ids
     backoff = RETRY_BASE_SECONDS
 
+    urls = watch.feed_urls
     print(
-        f"[{watch.name}] polling {watch.feed_url} every {POLL_INTERVAL_SECONDS}s "
-        f"for: {', '.join(watch.keywords)}",
+        f"[{watch.name}] ({watch.source}) polling {len(urls)} feed(s) every "
+        f"{POLL_INTERVAL_SECONDS}s for: {', '.join(watch.keywords)}",
         flush=True,
     )
+    for url in urls:
+        print(f"[{watch.name}]   - {url}", flush=True)
 
     while True:
         try:
