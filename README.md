@@ -4,20 +4,15 @@ Watches multiple sets of subreddits — one independent "watch" per project (e.g
 
 **This does not post, reply, or vote on Reddit.** It only reads public posts and writes a local file. Every actual reply is a manual decision. For the `readysetscholar` watch specifically, see `docs/Marketing/Direct-Outreach-Plan.md` in the `wa-homeschool-path` repo for reply templates and the reasoning behind keeping this manual.
 
-## 1. Get Reddit API access
+## Data source: RSS, not the official API
 
-As of 2026, this is no longer a two-minute self-serve step. `reddit.com/prefs/apps` now redirects to Devvit, Reddit's platform for apps that run hosted *inside* Reddit (installed onto a specific subreddit by that subreddit's moderators) — not a fit for an external read-only script watching subreddits you don't moderate.
+Reddit's 2026 Responsible Builder Policy gates real API access behind manual approval — both the standard developer path (`reddit.com/prefs/apps` now redirects to Devvit, which requires mod-installed presence on a specific subreddit, not a fit for watching communities you don't moderate) and, separately, an explicit commercial-use approval, since this tool arguably counts as commercial: it informs decisions for a paid product and a consulting practice, even though it takes no write actions on Reddit itself. Both paths were tried; neither is a reliable route for a small, independent tool like this.
 
-For that, Reddit has a separate data-access-request form (search Reddit's help center for "Developer Platform Accessing Reddit Data" if the link below moves). Fill it in honestly and specifically — vague personal-project descriptions are the most commonly rejected:
+Instead, this polls Reddit's plain per-subreddit RSS feeds (`reddit.com/r/homeschool/new/.rss`) — a long-standing, openly documented Reddit feature, which is a more defensible posture than hitting internal `.json` endpoints directly, but it is **not a sanctioned integration**. No SLA, no guarantee it keeps working, no recourse if Reddit changes or blocks it. Polling is deliberately infrequent (every 2 hours by default) since the actual use case is a periodic digest, not real-time alerting — lower request volume is both lower-risk and simply more considerate of Reddit's infrastructure.
 
-- **What benefit will this have for Redditors?** Be honest that a read-only monitor with no posting/replying has no direct benefit to Redditors — the honest framing is that it helps you notice real questions promptly so you can reply personally and substantively, same as if you'd found the post by browsing.
-- **What's missing from Devvit?** Devvit requires mod-installed presence on a specific community; this needs to watch subreddits you don't moderate, across multiple unrelated projects.
-- **Link to source code:** this repo — https://github.com/eljay179-consulting/reddit-monitor
-- **Subreddits:** whatever your current `watches.json` covers, plus a note that more will be added as new projects come up
+If Reddit ever approves either access request, or the RSS approach stops working, `monitor.py` would need reworking again — this is a fallback, not a foundation to build more on top of without revisiting.
 
-Approval isn't guaranteed and there's no published turnaround time — expect anywhere from days to no response at all.
-
-## 2. Configure
+## 1. Configure
 
 ```bash
 cp .env.example .env
@@ -25,8 +20,8 @@ cp watches.example.json watches.json
 ```
 
 Edit `.env`:
-- `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` — from step 1, once approved
-- `REDDIT_USER_AGENT` — replace `change_me` with your Reddit username (Reddit requires a descriptive, identifiable user agent)
+- `USER_AGENT` — replace `change_me` with your Reddit username. No credentials to obtain — just a descriptive header so this isn't anonymous-looking traffic.
+- `POLL_INTERVAL_SECONDS` — how often each watch checks its feed (default 7200 = 2 hours)
 - `HOST_VAULT_INBOX_PATH` — the real filesystem path to your PersonalKB vault's `_inbox/` folder **on the machine running `docker compose`** (johnsonserve). This is bind-mounted into the container — get it wrong and notes will land somewhere you won't see them.
 
 Edit `watches.json` — one entry per project:
@@ -48,11 +43,13 @@ Edit `watches.json` — one entry per project:
 }
 ```
 
-Each watch runs independently (its own thread, its own Reddit stream) — one project's subreddits or keywords erroring out doesn't affect the others. All watches write into the same `_inbox/`, tagged with `project: <name>` in the note's frontmatter so they're filterable in Obsidian.
+`subreddits` uses Reddit's multi-subreddit URL syntax (`sub1+sub2`) — the watch builds its feed URL from this directly (`reddit.com/r/{subreddits}/new/.rss`).
+
+Each watch runs independently (its own thread, its own poll schedule) — one project's feed erroring out doesn't affect the others. All watches write into the same `_inbox/`, tagged with `project: <name>` in the note's frontmatter so they're filterable in Obsidian.
 
 `watches.json` is gitignored, like `.env` — edit it directly on johnsonserve, it isn't part of what gets deployed from git.
 
-## 3. Deploy on johnsonserve
+## 2. Deploy on johnsonserve
 
 Copy this whole folder to johnsonserve (or see `DEPLOY.md` for the GitHub Actions auto-deploy setup), then:
 
@@ -70,12 +67,15 @@ You should see, once per watch:
 ```
 Loaded 1 watch(es) from /app/watches.json
 Writing matches to: /vault-inbox
-[readysetscholar] watching r/homeschool+Homeschooling for: transcript, gpa, ...
+Seen-state stored in: /app/state
+[readysetscholar] polling https://www.reddit.com/r/homeschool+Homeschooling/new/.rss every 7200s for: transcript, gpa, ...
 ```
+
+On the very first run for a given watch, nothing gets written for whatever's already in the feed — it seeds its "seen" state instead of notifying on it, the same way the old PRAW-based version's `skip_existing=True` worked. Only genuinely new posts after that first poll produce a note.
 
 ## What happens on a match
 
-A markdown note like `20260729-143022-reddit-readysetscholar-how-do-i-make-a-transcript.md` appears in `_inbox/`, with frontmatter (project, subreddit, URL, matched keywords, `replied: false`), the post title, a preview of the body.
+A markdown note like `20260729-143022-reddit-readysetscholar-how-do-i-make-a-transcript.md` appears in `_inbox/`, with frontmatter (project, subreddit, URL, matched keywords, `replied: false`), the post title, and a preview of the post (RSS gives an HTML snippet, which is stripped down to plain text for the note).
 
 ## Adding a new project
 
@@ -92,7 +92,7 @@ docker compose up -d --build # rebuild after editing monitor.py itself
 
 ## Notes on reliability
 
-- PRAW's submission stream (`subreddit.stream.submissions`) handles reconnection and skips duplicate posts on its own — no separate "seen posts" file to manage, per watch.
-- Each watch's stream loop retries with exponential backoff (30s up to 15min) if it errors, rather than crashing the whole process or the other watches.
+- Each watch keeps its own "seen post IDs" file (`/app/state/<name>.seen.json`, in a persistent Docker volume) so restarts don't re-notify on the whole current feed — only the RSS feed's own window (~25 latest posts) needs to be tracked, so this file stays small.
+- Each watch's poll loop retries with exponential backoff (60s up to 30min) if a fetch fails, rather than crashing the whole process or the other watches.
 - `restart: unless-stopped` in `docker-compose.yml` brings the container back if it crashes or the host reboots.
-- Runs read-only against Reddit's official API using approved access — not scraping unauthenticated endpoints.
+- This is explicitly not a sanctioned integration — see "Data source" above. Expect it to occasionally need attention if Reddit changes how RSS behaves for logged-out requests.

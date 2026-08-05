@@ -14,14 +14,26 @@ human decision. For the readysetscholar watch specifically, see
 docs/Marketing/Direct-Outreach-Plan.md in the wa-homeschool-path repo for
 reply templates.
 
-Each watch runs in its own thread against its own praw.Reddit instance (read
-credentials are the same; separate instances avoid any shared-state concerns
-between concurrent streams). A watch whose stream errors is retried with
-backoff rather than taking down the other watches or the whole process.
+DATA SOURCE: Reddit's public per-subreddit RSS feeds (e.g.
+reddit.com/r/homeschool/new/.rss), not the official Data API. Reddit's 2026
+Responsible Builder Policy gates real API access behind manual approval —
+both the standard developer path and, separately, an explicit commercial-use
+approval (this tool informs decisions for a paid product and a consulting
+practice, so it's arguably commercial) — and small/independent projects are
+described as frequently rejected either way. RSS is a long-standing, openly
+documented Reddit feature rather than gated API surface, which is a more
+defensible posture than hitting internal .json endpoints directly, but it is
+still not a sanctioned integration: no SLA, no guarantee it keeps working,
+and it should be treated as a genuine fallback, not a long-term foundation.
+Polling stays deliberately infrequent (see POLL_INTERVAL_SECONDS) since the
+actual use case is a periodic digest, not real-time alerting, and lower
+volume is also simply more considerate of Reddit's infrastructure.
 
-Uses PRAW's submission stream, which handles pagination and de-duplication
-of already-seen posts internally (skip_existing=True) — no separate
-seen-ID file to maintain, per watch.
+Each watch polls independently on its own thread and its own schedule. A
+watch whose fetch fails is retried with backoff rather than taking down the
+other watches or the whole process. Seen-post IDs persist to disk per watch
+(SEEN_STATE_DIR) so a container restart doesn't re-notify on everything
+currently in each feed.
 """
 
 import json
@@ -36,31 +48,50 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-import praw
+import feedparser
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-REDDIT_CLIENT_ID = os.environ["REDDIT_CLIENT_ID"]
-REDDIT_CLIENT_SECRET = os.environ["REDDIT_CLIENT_SECRET"]
-REDDIT_USER_AGENT = os.environ.get(
-    "REDDIT_USER_AGENT", "reddit-monitor/1.0 (by u/change_me)"
-)
+USER_AGENT = os.environ.get("USER_AGENT", "reddit-monitor/1.0 (by u/change_me)")
 
 VAULT_INBOX_PATH = Path(os.environ["VAULT_INBOX_PATH"])
 WATCHES_CONFIG_PATH = Path(os.environ.get("WATCHES_CONFIG_PATH", "/app/watches.json"))
+SEEN_STATE_DIR = Path(os.environ.get("SEEN_STATE_DIR", "/app/state"))
 
-# Seconds to wait before restarting a watch's stream after it errors out.
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", 2 * 60 * 60))  # 2h default
+REQUEST_TIMEOUT_SECONDS = 20
+
+# Seconds to wait before retrying a watch's poll after it errors out.
 # Backs off up to a cap rather than hammering Reddit on a sustained outage.
-RETRY_BASE_SECONDS = 30
-RETRY_MAX_SECONDS = 15 * 60
+RETRY_BASE_SECONDS = 60
+RETRY_MAX_SECONDS = 30 * 60
+
+# Seconds between starting each additional watch's thread, so simultaneous
+# first-requests from multiple watches don't collide on Reddit's per-IP rate
+# limit (empirically tight — see run_watch's docstring context above).
+STARTUP_STAGGER_SECONDS = 20
+
+# How many seen-post IDs to retain per watch. Reddit's per-subreddit RSS
+# returns ~25 latest posts, so this comfortably covers the feed window with
+# room to spare — not meant to be a long-term archive.
+MAX_SEEN_IDS = 500
 
 
 @dataclass
 class Watch:
     name: str
-    subreddits: str  # PRAW multireddit syntax, e.g. "homeschool+Homeschooling"
+    subreddits: str  # e.g. "homeschool+Homeschooling" — used to build the feed URL
     keywords: list[str]
+
+    @property
+    def feed_url(self) -> str:
+        return f"https://www.reddit.com/r/{self.subreddits}/new/.rss"
+
+    @property
+    def seen_ids_path(self) -> Path:
+        return SEEN_STATE_DIR / f"{self.name}.seen.json"
 
 
 def load_watches() -> list[Watch]:
@@ -78,6 +109,20 @@ def load_watches() -> list[Watch]:
     return watches
 
 
+def load_seen_ids(watch: Watch) -> set[str]:
+    if not watch.seen_ids_path.exists():
+        return set()
+    return set(json.loads(watch.seen_ids_path.read_text(encoding="utf-8")))
+
+
+def save_seen_ids(watch: Watch, seen_ids: set[str]) -> None:
+    SEEN_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # Trim rather than grow unboundedly — the feed window is small, so only
+    # the most recently seen IDs matter for de-duplication.
+    trimmed = list(seen_ids)[-MAX_SEEN_IDS:]
+    watch.seen_ids_path.write_text(json.dumps(trimmed), encoding="utf-8")
+
+
 def matches_keywords(text: str, keywords: list[str]) -> list[str]:
     text = text.lower()
     return [kw for kw in keywords if kw in text]
@@ -90,36 +135,59 @@ def slugify(text: str, max_len: int = 60) -> str:
     return text[:max_len].strip("-") or "untitled"
 
 
-def write_inbox_note(watch: Watch, submission, matched_keywords: list[str]) -> None:
+def fetch_entries(watch: Watch) -> list:
+    """Fetches and parses a watch's RSS feed. Raises on network/HTTP failure."""
+    response = requests.get(
+        watch.feed_url,
+        headers={"User-Agent": USER_AGENT},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    parsed = feedparser.parse(response.content)
+    return parsed.entries
+
+
+def write_inbox_note(watch: Watch, entry, matched_keywords: list[str]) -> None:
     VAULT_INBOX_PATH.mkdir(parents=True, exist_ok=True)
 
-    created = datetime.fromtimestamp(submission.created_utc, tz=timezone.utc)
+    created = datetime.now(timezone.utc)
+    if getattr(entry, "published_parsed", None):
+        created = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+
     timestamp = created.strftime("%Y%m%d-%H%M%S")
-    filename = f"{timestamp}-reddit-{watch.name}-{slugify(submission.title)}.md"
+    filename = f"{timestamp}-reddit-{watch.name}-{slugify(entry.title)}.md"
     filepath = VAULT_INBOX_PATH / filename
 
     if filepath.exists():
         return
 
-    body = (submission.selftext or "").strip()
+    # Reddit's RSS entry content is an HTML snippet (usually a thumbnail + a
+    # link back to the post) rather than the plain self-text PRAW would have
+    # given us. Strip tags for a readable preview rather than dumping raw HTML
+    # into the note.
+    raw_body = getattr(entry, "summary", "") or ""
+    body = re.sub(r"<[^>]+>", " ", raw_body)
+    body = re.sub(r"\s+", " ", body).strip()
     body_preview = (body[:500] + "…") if len(body) > 500 else body
+
+    link = getattr(entry, "link", "")
 
     note = f"""---
 tags: [reddit-lead, {watch.name}]
 project: {watch.name}
-source: reddit
-subreddit: r/{submission.subreddit.display_name}
-url: https://reddit.com{submission.permalink}
+source: reddit-rss
+subreddit: r/{watch.subreddits}
+url: {link}
 created: {created.isoformat()}
 matched_keywords: [{", ".join(matched_keywords)}]
 replied: false
 ---
 
-# {submission.title}
+# {entry.title}
 
-**Project:** {watch.name} · **r/{submission.subreddit.display_name}** · [{submission.permalink}](https://reddit.com{submission.permalink})
+**Project:** {watch.name} · **r/{watch.subreddits}** · [{link}]({link})
 
-{body_preview if body_preview else "*(link post, no self-text)*"}
+{body_preview if body_preview else "*(no preview available)*"}
 
 ---
 
@@ -131,35 +199,55 @@ Reply is manual — this note is only a heads-up.
     print(f"[{timestamp}] [{watch.name}] wrote inbox note: {filename}", flush=True)
 
 
+def poll_once(watch: Watch, seen_ids: set[str], first_run: bool) -> set[str]:
+    entries = fetch_entries(watch)
+    updated_seen_ids = set(seen_ids)
+
+    for entry in entries:
+        entry_id = getattr(entry, "id", None) or getattr(entry, "link", None)
+        if not entry_id or entry_id in seen_ids:
+            continue
+
+        updated_seen_ids.add(entry_id)
+
+        # On the very first run there's no seen-state yet — every post in the
+        # feed would look "new" and fire at once. Seed seen-state from the
+        # first fetch instead of notifying on it, mirroring the intent of
+        # PRAW's skip_existing=True from the earlier OAuth-based version.
+        if first_run:
+            continue
+
+        haystack = f"{entry.title}\n{getattr(entry, 'summary', '')}"
+        matched = matches_keywords(haystack, watch.keywords)
+        if matched:
+            write_inbox_note(watch, entry, matched)
+
+    return updated_seen_ids
+
+
 def run_watch(watch: Watch) -> None:
-    """Runs one watch's stream forever, restarting with backoff on error."""
+    """Polls one watch's RSS feed forever, retrying with backoff on error."""
+    seen_ids = load_seen_ids(watch)
+    first_run = not seen_ids
     backoff = RETRY_BASE_SECONDS
+
+    print(
+        f"[{watch.name}] polling {watch.feed_url} every {POLL_INTERVAL_SECONDS}s "
+        f"for: {', '.join(watch.keywords)}",
+        flush=True,
+    )
+
     while True:
         try:
-            reddit = praw.Reddit(
-                client_id=REDDIT_CLIENT_ID,
-                client_secret=REDDIT_CLIENT_SECRET,
-                user_agent=REDDIT_USER_AGENT,
-            )
-            reddit.read_only = True
-            subreddit = reddit.subreddit(watch.subreddits)
-
-            print(
-                f"[{watch.name}] watching r/{watch.subreddits} for: "
-                f"{', '.join(watch.keywords)}",
-                flush=True,
-            )
-            backoff = RETRY_BASE_SECONDS  # reset after a clean (re)connect
-
-            for submission in subreddit.stream.submissions(skip_existing=True):
-                haystack = f"{submission.title}\n{submission.selftext or ''}"
-                matched = matches_keywords(haystack, watch.keywords)
-                if matched:
-                    write_inbox_note(watch, submission, matched)
+            seen_ids = poll_once(watch, seen_ids, first_run)
+            save_seen_ids(watch, seen_ids)
+            first_run = False
+            backoff = RETRY_BASE_SECONDS  # reset after a clean poll
+            time.sleep(POLL_INTERVAL_SECONDS)
 
         except Exception:
             print(
-                f"[{watch.name}] stream error, retrying in {backoff}s:\n"
+                f"[{watch.name}] poll error, retrying in {backoff}s:\n"
                 f"{traceback.format_exc()}",
                 flush=True,
             )
@@ -171,12 +259,21 @@ def run() -> None:
     watches = load_watches()
     print(f"Loaded {len(watches)} watch(es) from {WATCHES_CONFIG_PATH}", flush=True)
     print(f"Writing matches to: {VAULT_INBOX_PATH}", flush=True)
+    print(f"Seen-state stored in: {SEEN_STATE_DIR}", flush=True)
 
     threads = [
         threading.Thread(target=run_watch, args=(watch,), name=watch.name, daemon=True)
         for watch in watches
     ]
-    for t in threads:
+    for i, t in enumerate(threads):
+        # Reddit's unauthenticated rate limit turned out tighter than
+        # expected in practice (a second request seconds after the first got
+        # a 429; recovery took 30-50s). With one watch this never matters —
+        # POLL_INTERVAL_SECONDS is hours. With several watches starting at
+        # once, though, their first requests would all land in the same
+        # instant. Staggering start times avoids that collision.
+        if i > 0:
+            time.sleep(STARTUP_STAGGER_SECONDS)
         t.start()
     for t in threads:
         t.join()

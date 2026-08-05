@@ -10,9 +10,18 @@ services:
       # host is set via HOST_VAULT_INBOX_PATH in .env, mapped below.
       VAULT_INBOX_PATH: /vault-inbox
       WATCHES_CONFIG_PATH: /app/watches.json
+      SEEN_STATE_DIR: /app/state
     volumes:
       - ${HOST_VAULT_INBOX_PATH}:/vault-inbox
       # watches.json is bind-mounted (not baked into the image) so adding or
       # editing a project's subreddits/keywords only needs a container
       # restart, not a rebuild.
       - ./watches.json:/app/watches.json:ro
+      # Persists which posts have already been seen per watch, so a restart
+      # doesn't re-notify on everything currently in each RSS feed. A named
+      # volume rather than a bind mount — nothing here needs to be human-
+      # readable or browsed, just kept around between runs.
+      - reddit_monitor_state:/app/state
+
+volumes:
+  reddit_monitor_state:

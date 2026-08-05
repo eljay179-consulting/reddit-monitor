@@ -27,7 +27,7 @@ git clone git@github.com:eljay179-consulting/reddit-monitor.git /path/to/reddit-
 cd /path/to/reddit-monitor
 cp .env.example .env
 cp watches.example.json watches.json
-# fill in .env for real (Reddit creds, HOST_VAULT_INBOX_PATH) and add your
+# fill in .env for real (USER_AGENT, HOST_VAULT_INBOX_PATH) and add your
 # projects' subreddits/keywords to watches.json — see README.md
 docker compose up -d --build
 ```
