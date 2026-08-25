@@ -1,8 +1,8 @@
 # reddit-monitor
 
-Watches multiple sets of subreddits — one independent "watch" per project (e.g. `readysetscholar`, `sagp`, `0x307`) — for posts matching that project's keywords, and writes a note per match into your PersonalKB vault's `_inbox/` folder for manual review.
+Watches multiple sets of subreddits, YouTube channels, or craigslist searches — one independent "watch" per project (e.g. `readysetscholar`, `sagp`, `0x307`) — for posts/listings matching that project's keywords, and writes a note per match into your PersonalKB vault's `_inbox/` folder for manual review.
 
-**This does not post, reply, or vote on Reddit.** It only reads public posts and writes a local file. Every actual reply is a manual decision. For the `readysetscholar` watch specifically, see `docs/Marketing/Direct-Outreach-Plan.md` in the `wa-homeschool-path` repo for reply templates and the reasoning behind keeping this manual.
+**This does not post, reply, bid, or otherwise act on Reddit/craigslist.** It only reads public posts/listings and writes a local file. Every actual reply or purchase is a manual decision. For the `readysetscholar` watch specifically, see `docs/Marketing/Direct-Outreach-Plan.md` in the `wa-homeschool-path` repo for reply templates and the reasoning behind keeping this manual.
 
 ## Data source: RSS, not the official API
 
@@ -11,6 +11,26 @@ Reddit's 2026 Responsible Builder Policy gates real API access behind manual app
 Instead, this polls Reddit's plain per-subreddit RSS feeds (`reddit.com/r/homeschool/new/.rss`) — a long-standing, openly documented Reddit feature, which is a more defensible posture than hitting internal `.json` endpoints directly, but it is **not a sanctioned integration**. No SLA, no guarantee it keeps working, no recourse if Reddit changes or blocks it. Polling is deliberately infrequent (every 2 hours by default) since the actual use case is a periodic digest, not real-time alerting — lower request volume is both lower-risk and simply more considerate of Reddit's infrastructure.
 
 If Reddit ever approves either access request, or the RSS approach stops working, `monitor.py` would need reworking again — this is a fallback, not a foundation to build more on top of without revisiting.
+
+## craigslist watches: HTML scrape, not RSS
+
+craigslist's own `format=rss` output started returning a hard "blocked" response as of 2026-08 (confirmed from both a server IP and a residential-browser session — not IP-specific). A `"source": "craigslist"` watch instead fetches the plain HTML search-results page and parses the no-JS static result list craigslist still server-renders on it (`<li class="cl-static-search-result">`) — a noscript fallback craigslist ships deliberately, not an internal endpoint, but still HTML scraping rather than a sanctioned feed. Same posture as the Reddit RSS approach: expect this to need attention if craigslist changes that markup.
+
+A craigslist watch's `targets` are full search-results URLs (not query fragments), since the query/category/area are already fully expressed there:
+
+```json
+{
+  "name": "marketplace-hardware",
+  "source": "craigslist",
+  "targets": [
+    "https://spokane.craigslist.org/search/sss?query=computer+hardware",
+    "https://spokane.craigslist.org/search/sss?query=weight+bench"
+  ],
+  "keywords": []
+}
+```
+
+An empty `keywords` list means "no additional filter" — every listing the search itself returns gets a note, since the search's own `query=` param already did the scoping. Non-empty keywords still work as an additional filter on top, same as reddit/youtube watches.
 
 ## 1. Configure
 

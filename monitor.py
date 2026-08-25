@@ -36,6 +36,7 @@ other watches or the whole process. Seen-post IDs persist to disk per watch
 currently in each feed.
 """
 
+import html
 import json
 import os
 import re
@@ -47,6 +48,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import feedparser
 import requests
@@ -83,12 +85,30 @@ INTER_FEED_DELAY_SECONDS = 5
 # room to spare — not meant to be a long-term archive.
 MAX_SEEN_IDS = 500
 
+# Craigslist's own format=rss output started returning a hard "blocked"
+# response as of 2026-08 (verified: same block from a residential-browser
+# session, not just server IPs) — so craigslist watches instead scrape the
+# plain HTML search-results page, which still server-renders a no-JS static
+# result list craigslist ships deliberately (<li class="cl-static-search-
+# result">, present even via plain requests.get, no browser/JS needed). This
+# is a noscript fallback craigslist maintains on purpose, not an internal
+# endpoint — but like the Reddit RSS approach above, treat it as a fallback
+# that can break, not a foundation.
+CRAIGSLIST_LISTING_RE = re.compile(
+    r'<li class="cl-static-search-result" title="(?P<title>[^"]*)">\s*'
+    r'<a href="(?P<url>[^"]*)">(?P<body>.*?)</a>\s*</li>',
+    re.S,
+)
+CRAIGSLIST_PRICE_RE = re.compile(r'<div class="price">([^<]*)</div>')
+CRAIGSLIST_LOCATION_RE = re.compile(r'<div class="location">\s*([^<]*?)\s*</div>')
+
 
 @dataclass
 class Watch:
     name: str
-    source: str  # "reddit" | "youtube"
-    targets: list[str]  # subreddit expressions, or YouTube channel IDs
+    source: str  # "reddit" | "youtube" | "craigslist"
+    targets: list[str]  # subreddit expressions, YouTube channel IDs, or (for
+    # craigslist) full search-results URLs
     keywords: list[str]
 
     @property
@@ -104,6 +124,11 @@ class Watch:
                 f"https://www.youtube.com/feeds/videos.xml?channel_id={t}"
                 for t in self.targets
             ]
+        if self.source == "craigslist":
+            # No feed-URL template to build here — a craigslist search
+            # (query, category, area) is already fully expressed in the
+            # search-results URL, so each target IS that URL verbatim.
+            return list(self.targets)
         raise ValueError(f"Unknown source {self.source!r} for watch {self.name!r}")
 
     @property
@@ -179,6 +204,44 @@ def fetch_feed(url: str) -> list:
     return parsed.entries
 
 
+def fetch_craigslist_listings(url: str) -> list:
+    """
+    Fetches one craigslist search-results page and returns a pseudo-entry
+    per listing — shaped enough like a feedparser entry (.id/.title/
+    .summary/.link) that write_inbox_note and matches_keywords can treat it
+    exactly like a Reddit/YouTube entry, with no source-specific branching
+    downstream of this function.
+    """
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+
+    entries = []
+    for m in CRAIGSLIST_LISTING_RE.finditer(response.text):
+        title = html.unescape(m.group("title"))
+        link = m.group("url")
+        body = m.group("body")
+
+        price_m = CRAIGSLIST_PRICE_RE.search(body)
+        location_m = CRAIGSLIST_LOCATION_RE.search(body)
+        price = html.unescape(price_m.group(1)).strip() if price_m else ""
+        location = html.unescape(location_m.group(1)).strip() if location_m else ""
+
+        # feedparser entries carry no separate "price" field, so fold it into
+        # summary alongside location — write_inbox_note only ever reads
+        # .title/.summary/.link/.id, same as for reddit/youtube entries.
+        summary = " · ".join(p for p in (price, location) if p)
+
+        entries.append(SimpleNamespace(id=link, title=title, summary=summary, link=link))
+    return entries
+
+
 def fetch_entries(watch: Watch) -> list:
     """
     Fetches every feed for a watch and returns the combined entries.
@@ -192,7 +255,10 @@ def fetch_entries(watch: Watch) -> list:
     for i, url in enumerate(urls):
         if i > 0:
             time.sleep(INTER_FEED_DELAY_SECONDS)
-        entries.extend(fetch_feed(url))
+        if watch.source == "craigslist":
+            entries.extend(fetch_craigslist_listings(url))
+        else:
+            entries.extend(fetch_feed(url))
     return entries
 
 
@@ -221,17 +287,25 @@ def write_inbox_note(watch: Watch, entry, matched_keywords: list[str]) -> None:
     link = getattr(entry, "link", "")
 
     # Reddit entries carry the subreddit in the category; YouTube carries the
-    # channel name in author. Fall back to the watch's own targets so the note
-    # always says where it came from.
+    # channel name in author; craigslist entries have no per-listing origin
+    # field, so summary (price · location) already carries that context.
+    # Fall back to the watch's own targets so the note always says where it
+    # came from.
     if watch.source == "youtube":
         origin = getattr(entry, "author", None) or ", ".join(watch.targets)
+    elif watch.source == "craigslist":
+        origin = "craigslist"
     else:
         origin = f"r/{'+'.join(watch.targets)}"
+
+    # craigslist entries come from scraped HTML, not an actual RSS feed —
+    # label it accurately rather than implying a feed that doesn't exist.
+    source_label = "craigslist-html" if watch.source == "craigslist" else f"{watch.source}-rss"
 
     note = f"""---
 tags: [feed-lead, {watch.source}, {watch.name}]
 project: {watch.name}
-source: {watch.source}-rss
+source: {source_label}
 origin: {origin}
 url: {link}
 created: {created.isoformat()}
@@ -273,8 +347,15 @@ def poll_once(watch: Watch, seen_ids: set[str], first_run: bool) -> set[str]:
         if first_run:
             continue
 
-        haystack = f"{entry.title}\n{getattr(entry, 'summary', '')}"
-        matched = matches_keywords(haystack, watch.keywords)
+        # An empty keyword list means the feed is already fully scoped (e.g.
+        # a craigslist search's own `query=` param) — treat every entry as a
+        # match rather than filtering out everything, which is what an empty
+        # keyword list would otherwise do.
+        if watch.keywords:
+            haystack = f"{entry.title}\n{getattr(entry, 'summary', '')}"
+            matched = matches_keywords(haystack, watch.keywords)
+        else:
+            matched = ["(search already scoped — no keyword filter)"]
         if matched:
             write_inbox_note(watch, entry, matched)
 
