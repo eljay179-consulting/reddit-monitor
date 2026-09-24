@@ -1,6 +1,8 @@
 # reddit-monitor
 
-Watches multiple sets of subreddits, YouTube channels, or craigslist searches — one independent "watch" per project (e.g. `readysetscholar`, `sagp`, `0x307`) — for posts/listings matching that project's keywords, and writes a note per match into your PersonalKB vault's `_inbox/` folder for manual review.
+Watches multiple sets of subreddits, YouTube channels, or craigslist searches — one independent "watch" per project (e.g. `readysetscholar`, `sagp`, `0x307`) — for posts/listings matching that project's keywords, and appends each match to that project's monthly **signal log** in the PersonalKB vault (`00-shared/signals/<project>/YYYY-MM.md`) for review.
+
+(Until 2026-09-24 it wrote one note per match into `_inbox/`. Nothing ingested those, so they piled up. The logs need no cleanup: consumers read the dated entries they need.)
 
 **This does not post, reply, bid, or otherwise act on Reddit/craigslist.** It only reads public posts/listings and writes a local file. Every actual reply or purchase is a manual decision. For the `readysetscholar` watch specifically, see `docs/Marketing/Direct-Outreach-Plan.md` in the `wa-homeschool-path` repo for reply templates and the reasoning behind keeping this manual.
 
@@ -42,7 +44,7 @@ cp watches.example.json watches.json
 Edit `.env`:
 - `USER_AGENT` — replace `change_me` with your Reddit username. No credentials to obtain — just a descriptive header so this isn't anonymous-looking traffic.
 - `POLL_INTERVAL_SECONDS` — how often each watch checks its feed (default 7200 = 2 hours)
-- `HOST_VAULT_INBOX_PATH` — the real filesystem path to your PersonalKB vault's `_inbox/` folder **on the machine running `docker compose`** (johnsonserve). This is bind-mounted into the container — get it wrong and notes will land somewhere you won't see them.
+- `HOST_VAULT_PATH` — the real filesystem path to the PersonalKB vault **root** on the machine running `docker compose` (johnsonserve). Only `00-shared/signals/` and `50-personal/signals/` under it are mounted into the container, never the whole vault. Create both folders as the `RUN_AS_UID` user before the first `docker compose up`, or Docker creates them root-owned.
 
 Edit `watches.json` — one entry per project:
 
@@ -65,7 +67,7 @@ Edit `watches.json` — one entry per project:
 
 `subreddits` uses Reddit's multi-subreddit URL syntax (`sub1+sub2`) — the watch builds its feed URL from this directly (`reddit.com/r/{subreddits}/new/.rss`).
 
-Each watch runs independently (its own thread, its own poll schedule) — one project's feed erroring out doesn't affect the others. All watches write into the same `_inbox/`, tagged with `project: <name>` in the note's frontmatter so they're filterable in Obsidian.
+Each watch runs independently (its own thread, its own poll schedule) — one project's feed erroring out doesn't affect the others. Each watch logs to `00-shared/signals/<name>/` by default. Set `"log_dir"` on a watch to send it elsewhere; it must sit under one of the mounted `SIGNAL_ROOTS` (the craigslist watches use `50-personal/signals/marketplace`, which stays out of git).
 
 `watches.json` is gitignored, like `.env` — edit it directly on johnsonserve, it isn't part of what gets deployed from git.
 
@@ -95,7 +97,7 @@ On the very first run for a given watch, nothing gets written for whatever's alr
 
 ## What happens on a match
 
-A markdown note like `20260729-143022-reddit-readysetscholar-how-do-i-make-a-transcript.md` appears in `_inbox/`, with frontmatter (project, subreddit, URL, matched keywords, `replied: false`), the post title, and a preview of the post (RSS gives an HTML snippet, which is stripped down to plain text for the note).
+A line is appended to `00-shared/signals/<project>/YYYY-MM.md`: the date, the subreddit or channel, the linked title, the matched keywords, and a short plain-text preview. A link that's already in the month's log is skipped. `backfill_logs.py` migrates old `_inbox/` notes into the same format.
 
 ## Adding a new project
 

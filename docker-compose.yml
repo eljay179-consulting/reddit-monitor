@@ -13,18 +13,23 @@ services:
     # bind-mounted Obsidian vault that other tooling (Obsidian itself, the
     # personalkb-git-sync script, syncthing) touches as a normal user — a
     # root-owned note in there is one they can't edit or commit. Set
-    # RUN_AS_UID/GID in .env to the owner of HOST_VAULT_INBOX_PATH.
+    # RUN_AS_UID/GID in .env to the owner of HOST_VAULT_PATH.
     user: "${RUN_AS_UID}:${RUN_AS_GID}"
     env_file:
       - .env
     environment:
-      # Fixed path inside the container — the actual vault location on the
-      # host is set via HOST_VAULT_INBOX_PATH in .env, mapped below.
-      VAULT_INBOX_PATH: /vault-inbox
+      # The vault root inside the container. Only the two signal-log folders
+      # are mounted under it (below), never the whole vault: this process
+      # parses untrusted feed content and needs write access to nothing else.
+      VAULT_PATH: /vault
+      SIGNAL_ROOTS: 00-shared/signals,50-personal/signals
       WATCHES_CONFIG_PATH: /app/watches.json
       SEEN_STATE_DIR: /app/state
     volumes:
-      - ${HOST_VAULT_INBOX_PATH}:/vault-inbox
+      # Both host folders must exist and be owned by RUN_AS_UID before
+      # `docker compose up`, or Docker creates them root-owned.
+      - ${HOST_VAULT_PATH}/00-shared/signals:/vault/00-shared/signals
+      - ${HOST_VAULT_PATH}/50-personal/signals:/vault/50-personal/signals
       # watches.json is bind-mounted (not baked into the image) so adding or
       # editing a project's subreddits/keywords only needs a container
       # restart, not a rebuild.

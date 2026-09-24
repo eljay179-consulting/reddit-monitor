@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY monitor.py .
+COPY monitor.py signal_log.py .
 
 # The container runs as the vault owner (see `user:` in docker-compose.yml)
 # rather than root, so notes land in the Obsidian vault owned by a normal
