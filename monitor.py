@@ -54,11 +54,23 @@ import feedparser
 import requests
 from dotenv import load_dotenv
 
+import signal_log
+
 load_dotenv()
 
 USER_AGENT = os.environ.get("USER_AGENT", "reddit-monitor/1.0 (by u/change_me)")
 
-VAULT_INBOX_PATH = Path(os.environ["VAULT_INBOX_PATH"])
+# The vault root as seen inside the container. Only the signal-log folders are
+# bind-mounted under it (see docker-compose.yml), not the whole vault: this
+# process parses untrusted feed content, so it gets write access to nothing else.
+VAULT_PATH = Path(os.environ.get("VAULT_PATH", "/vault"))
+# Folders (relative to the vault) a watch's log_dir may live under. Each must be
+# a real mount; a log_dir outside them would write into the container and vanish.
+SIGNAL_ROOTS = [
+    r.strip().strip("/")
+    for r in os.environ.get("SIGNAL_ROOTS", "00-shared/signals,50-personal/signals").split(",")
+    if r.strip()
+]
 WATCHES_CONFIG_PATH = Path(os.environ.get("WATCHES_CONFIG_PATH", "/app/watches.json"))
 SEEN_STATE_DIR = Path(os.environ.get("SEEN_STATE_DIR", "/app/state"))
 
@@ -110,6 +122,8 @@ class Watch:
     targets: list[str]  # subreddit expressions, YouTube channel IDs, or (for
     # craigslist) full search-results URLs
     keywords: list[str]
+    # Vault-relative folder for this watch's monthly signal logs.
+    log_dir: str = ""
 
     @property
     def feed_urls(self) -> list[str]:
@@ -158,11 +172,18 @@ def load_watches() -> list[Watch]:
                 source=source,
                 targets=targets,
                 keywords=[k.strip().lower() for k in w["keywords"] if k.strip()],
+                log_dir=w.get("log_dir", f"00-shared/signals/{w['name']}").strip("/"),
             )
         )
 
     if not watches:
         raise ValueError(f"No watches defined in {WATCHES_CONFIG_PATH}")
+    for w in watches:
+        root = next((r for r in SIGNAL_ROOTS if w.log_dir == r or w.log_dir.startswith(r + "/")), None)
+        if root is None:
+            raise ValueError(f"[{w.name}] log_dir {w.log_dir!r} is not under SIGNAL_ROOTS {SIGNAL_ROOTS}")
+        if not (VAULT_PATH / root).is_dir():
+            raise ValueError(f"[{w.name}] {VAULT_PATH / root} is missing; is it mounted?")
     return watches
 
 
@@ -208,7 +229,7 @@ def fetch_craigslist_listings(url: str) -> list:
     """
     Fetches one craigslist search-results page and returns a pseudo-entry
     per listing — shaped enough like a feedparser entry (.id/.title/
-    .summary/.link) that write_inbox_note and matches_keywords can treat it
+    .summary/.link) that write_signal_entry and matches_keywords can treat it
     exactly like a Reddit/YouTube entry, with no source-specific branching
     downstream of this function.
     """
@@ -234,7 +255,7 @@ def fetch_craigslist_listings(url: str) -> list:
         location = html.unescape(location_m.group(1)).strip() if location_m else ""
 
         # feedparser entries carry no separate "price" field, so fold it into
-        # summary alongside location — write_inbox_note only ever reads
+        # summary alongside location — write_signal_entry only ever reads
         # .title/.summary/.link/.id, same as for reddit/youtube entries.
         summary = " · ".join(p for p in (price, location) if p)
 
@@ -262,71 +283,36 @@ def fetch_entries(watch: Watch) -> list:
     return entries
 
 
-def write_inbox_note(watch: Watch, entry, matched_keywords: list[str]) -> None:
-    VAULT_INBOX_PATH.mkdir(parents=True, exist_ok=True)
-
+def write_signal_entry(watch: Watch, entry, matched_keywords: list[str]) -> None:
     created = datetime.now(timezone.utc)
     if getattr(entry, "published_parsed", None):
         created = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
 
-    timestamp = created.strftime("%Y%m%d-%H%M%S")
-    filename = f"{timestamp}-{watch.source}-{watch.name}-{slugify(entry.title)}.md"
-    filepath = VAULT_INBOX_PATH / filename
-
-    if filepath.exists():
-        return
-
-    # Reddit's RSS content is an HTML snippet (thumbnail + link back to the
-    # post) rather than plain self-text; YouTube's is the video description.
-    # Strip tags either way rather than dumping raw HTML into the note.
-    raw_body = getattr(entry, "summary", "") or ""
-    body = re.sub(r"<[^>]+>", " ", raw_body)
-    body = re.sub(r"\s+", " ", body).strip()
-    body_preview = (body[:500] + "…") if len(body) > 500 else body
-
-    link = getattr(entry, "link", "")
-
     # Reddit entries carry the subreddit in the category; YouTube carries the
-    # channel name in author; craigslist entries have no per-listing origin
-    # field, so summary (price · location) already carries that context.
-    # Fall back to the watch's own targets so the note always says where it
-    # came from.
+    # channel name in author; craigslist has no per-listing origin, so its
+    # summary (price · location) goes in the preview instead.
     if watch.source == "youtube":
         origin = getattr(entry, "author", None) or ", ".join(watch.targets)
     elif watch.source == "craigslist":
         origin = "craigslist"
     else:
-        origin = f"r/{'+'.join(watch.targets)}"
+        tags = getattr(entry, "tags", None) or []
+        sub = tags[0].get("term") if tags and isinstance(tags[0], dict) else None
+        origin = f"r/{sub}" if sub else f"r/{'+'.join(watch.targets)}"
 
-    # craigslist entries come from scraped HTML, not an actual RSS feed —
-    # label it accurately rather than implying a feed that doesn't exist.
-    source_label = "craigslist-html" if watch.source == "craigslist" else f"{watch.source}-rss"
-
-    note = f"""---
-tags: [feed-lead, {watch.source}, {watch.name}]
-project: {watch.name}
-source: {source_label}
-origin: {origin}
-url: {link}
-created: {created.isoformat()}
-matched_keywords: [{", ".join(matched_keywords)}]
-reviewed: false
----
-
-# {entry.title}
-
-**Project:** {watch.name} · **{origin}** · [{link}]({link})
-
-{body_preview if body_preview else "*(no preview available)*"}
-
----
-
-Matched on: {", ".join(matched_keywords)}
-
-Surfaced for review — any reply or action is manual.
-"""
-    filepath.write_text(note, encoding="utf-8")
-    print(f"[{timestamp}] [{watch.name}] wrote inbox note: {filename}", flush=True)
+    written = signal_log.append_entry(
+        VAULT_PATH,
+        watch.log_dir,
+        watch.name,
+        created,
+        origin,
+        entry.title,
+        getattr(entry, "link", ""),
+        matched_keywords,
+        getattr(entry, "summary", "") or "",
+    )
+    if written:
+        print(f"[{created:%Y%m%d-%H%M%S}] [{watch.name}] logged: {entry.title[:80]}", flush=True)
 
 
 def poll_once(watch: Watch, seen_ids: set[str], first_run: bool) -> set[str]:
@@ -357,7 +343,7 @@ def poll_once(watch: Watch, seen_ids: set[str], first_run: bool) -> set[str]:
         else:
             matched = ["(search already scoped — no keyword filter)"]
         if matched:
-            write_inbox_note(watch, entry, matched)
+            write_signal_entry(watch, entry, matched)
 
     return updated_seen_ids
 
@@ -398,7 +384,8 @@ def run_watch(watch: Watch) -> None:
 def run() -> None:
     watches = load_watches()
     print(f"Loaded {len(watches)} watch(es) from {WATCHES_CONFIG_PATH}", flush=True)
-    print(f"Writing matches to: {VAULT_INBOX_PATH}", flush=True)
+    for w in watches:
+        print(f"[{w.name}] logging to {VAULT_PATH / w.log_dir}/YYYY-MM.md", flush=True)
     print(f"Seen-state stored in: {SEEN_STATE_DIR}", flush=True)
 
     threads = [
